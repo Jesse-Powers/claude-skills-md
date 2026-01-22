@@ -1,0 +1,311 @@
+# n8n Automation Best Practices (Playbook)
+
+> Goal: build workflows that are **reliable, secure, observable, maintainable**, and easy to scale.
+
+---
+
+## 1) Workflow design principles
+
+### Keep workflows small and composable
+
+- Prefer **multiple focused workflows** over one giant “god workflow”.
+- Use **Execute Workflow** for reuse (shared utilities like: normalize data, send Slack alert, format email, etc.).
+- Separate concerns:
+  - **Ingest** (trigger + validation)
+  - **Process** (transform + business logic)
+  - **Deliver** (write to DB, call APIs, send notifications)
+
+### Make every workflow predictable
+
+- Aim for **idempotency** (running twice shouldn’t duplicate side effects).
+- Track state using:
+  - A **dedupe key** (event id, message id, order id, etc.)
+  - A **checkpoint** (last processed timestamp / cursor)
+
+### Prefer explicit inputs/outputs
+
+- Normalize incoming payloads early.
+- Output consistent structure from each “stage” node (same keys, same types).
+
+---
+
+## 2) Naming, docs, and structure (maintainability)
+
+### Naming conventions
+
+- Workflow name format:
+  - `TRIGGER - Domain - Action - v1`
+  - Example: `WEBHOOK - Orders - Create Invoice - v1`
+- Node name format:
+  - `Verb + Object` + optional suffix
+  - Examples: `Validate Payload`, `Fetch Customer`, `Upsert Order (DB)`, `Notify Slack (Error)`
+
+### Add in-workflow documentation
+
+- Add a **Sticky Note** at the top:
+  - Purpose, owner, inputs, outputs, dependencies, failure modes
+- Add Sticky Notes for:
+  - Why a node exists
+  - Any non-obvious mapping/transform logic
+
+### Foldering / tags
+
+- Use tags like: `prod`, `staging`, `billing`, `alerts`, `critical`
+- Maintain “library workflows” tagged `shared` or `utils`
+
+---
+
+## 3) Data handling best practices
+
+### Validate early
+
+- Validate required fields right after the trigger:
+  - missing keys, types, empty strings, invalid timestamps
+- Fail fast with a clear error message.
+
+### Normalize consistently
+
+- Convert dates to ISO strings (`YYYY-MM-DDTHH:mm:ssZ`).
+- Use consistent naming: `snake_case` or `camelCase` (pick one).
+
+### Don’t overuse giant expressions
+
+- If an expression becomes hard to read:
+  - Move it to a **Set** node (or Code node) with clearly named fields.
+- Avoid “mystery math” inside a single node.
+
+---
+
+## 4) Error handling and resilience
+
+### Always design for failure
+
+- Use **Error Trigger** workflow for centralized alerting:
+  - Slack/Email + include workflow name, execution id, node, error message
+- In critical flows, add “guardrails”:
+  - If API returns unexpected response → stop and alert
+
+### Retry strategy
+
+- Use retries for transient issues (timeouts, 429, 5xx).
+- Add **backoff** if possible (wait nodes / rate limit patterns).
+- Don’t retry on:
+  - Validation errors (4xx like 400/401/403 unless token refresh)
+  - Permanent business logic errors (e.g., “order not found”)
+
+### Timeouts and partial failures
+
+- For multi-step operations, record progress:
+  - Mark “started”, “finished”, “failed” in DB/log store.
+- For fan-out steps, consider:
+  - processing items individually + capturing per-item failure details.
+
+---
+
+## 5) Idempotency and deduplication (must-have)
+
+### Webhooks
+
+- Expect retries from upstream services.
+- Store a unique `event_id` and ignore duplicates:
+  - e.g., DB table `processed_events(event_id, created_at)`
+
+### Side effects
+
+- Before sending an email / creating invoice / writing record:
+  - check “already done?” using the dedupe key.
+
+---
+
+## 6) Security best practices
+
+### Credentials and secrets
+
+- Never hardcode secrets in nodes or notes.
+- Use **n8n Credentials** and environment variables where possible.
+- Principle of least privilege:
+  - API keys scoped only to needed endpoints
+  - DB user limited to required schema/actions
+
+### Webhook protection
+
+Use at least one:
+
+- **Secret token** header (e.g., `X-Signature` / `Authorization: Bearer ...`)
+- **HMAC signature verification** (best) if provider supports it
+- **IP allowlist** (if stable IPs) at reverse proxy (Nginx/Cloudflare)
+- **Basic auth** for internal webhooks (still prefer token/HMAC)
+
+### Data privacy
+
+- Don’t log sensitive payloads.
+- Mask PII in error notifications (emails, phone, addresses).
+
+---
+
+## 7) Observability (logging + metrics)
+
+### Log with intention
+
+- Log:
+  - input summary (not full payload)
+  - dedupe key
+  - external request id / correlation id
+  - result status and duration
+- Use a consistent log format:
+  - `level`, `workflow`, `executionId`, `dedupeKey`, `message`
+
+### Alerts that matter
+
+- Alert on:
+  - repeated failures (threshold-based)
+  - “stuck” workflows (no success in X hours)
+  - downstream API outages (spike in 5xx/timeout)
+
+### Execution data retention
+
+- Keep enough history for debugging.
+- Don’t keep everything forever (cost + privacy).
+
+---
+
+## 8) Performance and scaling
+
+### Use batching and pagination
+
+- For large lists:
+  - fetch in pages
+  - process with split/batch patterns
+- Avoid loading huge payloads into memory when you can stream/page.
+
+### Control concurrency
+
+- Limit parallel requests to rate-limited APIs.
+- Use queue mode / workers if you have heavy workloads.
+
+### Reduce external calls
+
+- Cache where possible:
+  - static lookup tables
+  - repeated “get account config” calls per item
+
+---
+
+## 9) Environment management (dev/staging/prod)
+
+### Separate environments
+
+- At minimum:
+  - `dev` and `prod` with different credentials and webhooks
+- Use environment variables:
+  - base URLs
+  - feature flags
+  - notification channels
+
+### Safe deployments
+
+- Version workflows:
+  - duplicate → modify → test → switch traffic → retire old
+- Add a “kill switch”:
+  - env var `WORKFLOW_DISABLED=true` or a guard node
+
+---
+
+## 10) Testing approach
+
+### Test data
+
+- Keep a set of sample payloads (JSON) for each trigger.
+- Use manual runs with known fixtures.
+
+### Mock risky side effects
+
+- In dev:
+  - route emails to a test inbox
+  - use sandbox APIs (Stripe test mode, etc.)
+  - write to dev DB schema
+
+### Regression checklist
+
+- Validation works
+- Dedupe works
+- Error handling alerts work
+- Retries don’t create duplicates
+- Performance acceptable under expected load
+
+---
+
+## 11) Version control and change tracking
+
+### Export workflows
+
+- Export workflow JSON regularly.
+- Store in Git with:
+  - `workflows/` folder
+  - clear commit messages
+- Document dependencies:
+  - credentials names (not values)
+  - external services
+  - DB schema references
+
+### Change discipline
+
+- One change per commit.
+- Include:
+  - what changed
+  - why it changed
+  - how to test
+
+---
+
+## 12) Operational checklist (production readiness)
+
+### Before going live
+
+- [ ] Trigger authentication/verification in place
+- [ ] Dedupe key enforced
+- [ ] Central error handling with alerts
+- [ ] Timeouts and retries configured
+- [ ] Secrets in credentials, not in nodes
+- [ ] Logging is useful but not sensitive
+- [ ] Rate limiting / backoff strategy set
+- [ ] Backup / export workflow JSON stored in Git
+- [ ] Monitoring: failure rate + success heartbeat
+
+### After launch
+
+- [ ] Review error alerts weekly
+- [ ] Remove dead code / unused nodes
+- [ ] Rotate keys regularly
+- [ ] Periodically test disaster recovery (restore workflow + creds)
+
+---
+
+## Recommended workflow template (structure)
+
+1. **Trigger**
+2. **Auth/Verify** (webhook signature/token)
+3. **Validate Input**
+4. **Dedupe Check**
+5. **Main Logic** (split into sub-workflows if big)
+6. **Write Side Effects** (DB/API/email)
+7. **Success Log**
+8. **Error Path** → notify + store error context
+
+---
+
+## Quick “Do / Don’t”
+
+**Do**
+
+- Keep workflows readable, documented, and modular
+- Make retries safe with idempotency
+- Centralize error reporting
+- Separate dev/prod and rotate secrets
+
+**Don’t**
+
+- Hardcode secrets
+- Build mega-workflows with no structure
+- Retry blindly (duplicates!)
+- Log full payloads containing sensitive data
